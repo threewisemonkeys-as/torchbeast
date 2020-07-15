@@ -14,7 +14,9 @@
 
 import argparse
 import logging
+from multiprocessing import Value
 import os
+import pdb
 import pprint
 import threading
 import time
@@ -24,22 +26,22 @@ import typing
 
 os.environ["OMP_NUM_THREADS"] = "1"  # Necessary for multithreading.
 
+import gym
 import torch
 from torch import multiprocessing as mp
 from torch import nn
 from torch.nn import functional as F
 
-from torchbeast import atari_wrappers
-from torchbeast.core import environment
-from torchbeast.core import file_writer
-from torchbeast.core import prof
-from torchbeast.core import vtrace
+from .core.environment import Environment
+from .core import file_writer
+from .core import prof
+from .core import vtrace
 
 
 # yapf: disable
 parser = argparse.ArgumentParser(description="PyTorch Scalable Agent")
 
-parser.add_argument("--env", type=str, default="PongNoFrameskip-v4",
+parser.add_argument("--env", type=str, default="CartPole-v1",
                     help="Gym environment.")
 parser.add_argument("--mode", default="train",
                     choices=["train", "test", "test_render"],
@@ -138,10 +140,10 @@ def act(
         logging.info("Actor %i started.", actor_index)
         timings = prof.Timings()  # Keep track of how fast things are.
 
-        gym_env = create_env(flags)
+        gym_env = make_env(flags)
         seed = actor_index ^ int.from_bytes(os.urandom(4), byteorder="little")
         gym_env.seed(seed)
-        env = environment.Environment(gym_env)
+        env = Environment(gym_env)
         env_output = env.initial()
         agent_state = model.initial_state(batch_size=1)
         agent_output, unused_state = model(env_output, agent_state)
@@ -249,6 +251,8 @@ def learn(
             clipped_rewards = torch.clamp(rewards, -1, 1)
         elif flags.reward_clipping == "none":
             clipped_rewards = rewards
+        else:
+            raise ValueError("Reward clipping has invalid value")
 
         discounts = (~batch["done"]).float() * flags.discounting
 
@@ -299,7 +303,7 @@ def learn(
 def create_buffers(flags, obs_shape, num_actions) -> Buffers:
     T = flags.unroll_length
     specs = dict(
-        frame=dict(size=(T + 1, *obs_shape), dtype=torch.uint8),
+        frame=dict(size=(T + 1, *obs_shape), dtype=torch.float64),
         reward=dict(size=(T + 1,), dtype=torch.float32),
         done=dict(size=(T + 1,), dtype=torch.bool),
         episode_return=dict(size=(T + 1,), dtype=torch.float32),
@@ -344,7 +348,7 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
         logging.info("Not using CUDA.")
         flags.device = torch.device("cpu")
 
-    env = create_env(flags)
+    env = make_env(flags)
 
     model = Net(env.observation_space.shape, env.action_space.n, flags.use_lstm)
     buffers = create_buffers(flags, env.observation_space.shape, model.num_actions)
@@ -507,14 +511,14 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
 
 def test(flags, num_episodes: int = 10):
     if flags.xpid is None:
-        checkpointpath = "./latest/model.tar"
+        checkpointpath = "/home/twm/logs/torchbeast/latest/model.tar"
     else:
         checkpointpath = os.path.expandvars(
             os.path.expanduser("%s/%s/%s" % (flags.savedir, flags.xpid, "model.tar"))
         )
 
-    gym_env = create_env(flags)
-    env = environment.Environment(gym_env)
+    gym_env = make_env(flags)
+    env = Environment(gym_env)
     model = Net(gym_env.observation_space.shape, gym_env.action_space.n, flags.use_lstm)
     model.eval()
     checkpoint = torch.load(checkpointpath, map_location="cpu")
@@ -542,24 +546,29 @@ def test(flags, num_episodes: int = 10):
     )
 
 
-class AtariNet(nn.Module):
+class ConvNet(nn.Module):
     def __init__(self, observation_shape, num_actions, use_lstm=False):
-        super(AtariNet, self).__init__()
+        super(ConvNet, self).__init__()
         self.observation_shape = observation_shape
         self.num_actions = num_actions
 
         # Feature extraction.
-        self.conv1 = nn.Conv2d(
-            in_channels=self.observation_shape[0],
-            out_channels=32,
-            kernel_size=8,
-            stride=4,
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(self.observation_shape[-1], 32, 8, 4),
+            nn.ReLU(),
+            nn.BatchNorm2d(32),
+            nn.MaxPool2d(2),
+            nn.Dropout(p=0.8),
+            nn.Conv2d(32, 64, 4, 2),
+            nn.ReLU(),
+            nn.BatchNorm2d(64),
+            nn.MaxPool2d(2),
+            nn.Dropout(p=0.8),
+            nn.Conv2d(64, 64, 3, 1),
         )
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
 
         # Fully connected layer.
-        self.fc = nn.Linear(3136, 512)
+        self.fc = nn.Linear(2560, 512)
 
         # FC output size + one-hot of last action + last reward.
         core_output_size = self.fc.out_features + num_actions + 1
@@ -580,13 +589,11 @@ class AtariNet(nn.Module):
         )
 
     def forward(self, inputs, core_state=()):
-        x = inputs["frame"]  # [T, B, C, H, W].
+        x = inputs["frame"].transpose(-2, -1).transpose(-3, -2)  # [T, B, H, W, C] -> [T, B, C, H, W].
         T, B, *_ = x.shape
         x = torch.flatten(x, 0, 1)  # Merge time and batch.
         x = x.float() / 255.0
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
+        x = self.feature_extractor(x)
         x = x.view(T * B, -1)
         x = F.relu(self.fc(x))
 
@@ -632,18 +639,122 @@ class AtariNet(nn.Module):
         )
 
 
-Net = AtariNet
+class SimpleNet(nn.Module):
+    def __init__(self, observation_shape, num_actions, use_lstm=False):  # , hidden_dims=[128]):
+        super(SimpleNet, self).__init__()
+        self.observation_shape = observation_shape
+        self.num_actions = num_actions
 
+        # self.hidden_dims = hidden_dims
+        # obs_dim = observation_shape
+        # dims = [obs_dim, *hidden_dims, num_actions]
+        # self.lin_layers = nn.ModuleList(
+        #     [nn.Linear(dims[i], dims[i + 1]) for i in range(len(dims) - 1)]
+        # )
 
-def create_env(flags):
-    return atari_wrappers.wrap_pytorch(
-        atari_wrappers.wrap_deepmind(
-            atari_wrappers.make_atari(flags.env),
-            clip_rewards=False,
-            frame_stack=True,
-            scale=False,
+        # # Feature extraction.
+        # self.conv1 = nn.Conv2d(
+        #     in_channels=self.observation_shape[0],
+        #     out_channels=32,
+        #     kernel_size=8,
+        #     stride=4,
+        # )
+        # self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        # self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+
+        # Fully connected layer.
+        self.fc = nn.Linear(observation_shape[0], 128).to(dtype=torch.float64)
+
+        # FC output size + one-hot of last action + last reward.
+        core_output_size = self.fc.out_features + num_actions + 1
+
+        self.use_lstm = use_lstm
+        if use_lstm:
+            self.core = nn.LSTM(core_output_size, core_output_size, 2).to(dtype=torch.float64)
+
+        self.policy = nn.Linear(core_output_size, self.num_actions).to(dtype=torch.float64)
+        self.baseline = nn.Linear(core_output_size, 1).to(dtype=torch.float64)
+
+    def initial_state(self, batch_size):
+        if not self.use_lstm:
+            return tuple()
+        return tuple(
+            torch.zeros(self.core.num_layers, batch_size, self.core.hidden_size)
+            for _ in range(2)
         )
-    )
+
+    def forward(self, inputs, core_state=()):
+        x = inputs["frame"]  # [T, B, C, H, W].
+        T, B, *_ = x.shape
+        x = torch.flatten(x, 0, 1)  # Merge time and batch.
+        # x = x.float() / 255.0
+        # x = F.relu(self.conv1(x))
+        # x = F.relu(self.conv2(x))
+        # x = F.relu(self.conv3(x))
+        x = x.view(T * B, -1)
+        x = F.relu(self.fc(x))
+
+        one_hot_last_action = F.one_hot(
+            inputs["last_action"].view(T * B), self.num_actions
+        ).to(x.dtype)
+        clipped_reward = torch.clamp(inputs["reward"], -1, 1).view(T * B, 1).to(x.dtype)
+        core_input = torch.cat([x, clipped_reward, one_hot_last_action], dim=-1)
+
+        if self.use_lstm:
+            core_input = core_input.view(T, B, -1)
+            core_output_list = []
+            notdone = (~inputs["done"]).float()
+            for input, nd in zip(core_input.unbind(), notdone.unbind()):
+                # Reset core state to zero whenever an episode ended.
+                # Make `done` broadcastable with (num_layers, B, hidden_size)
+                # states:
+                nd = nd.view(1, -1, 1)
+                core_state = tuple(nd * s for s in core_state)
+                output, core_state = self.core(input.unsqueeze(0), core_state)
+                core_output_list.append(output)
+            core_output = torch.flatten(torch.cat(core_output_list), 0, 1)
+        else:
+            core_output = core_input
+            core_state = tuple()
+
+        policy_logits = self.policy(core_output)
+        baseline = self.baseline(core_output)
+
+        if self.training:
+            action = torch.multinomial(F.softmax(policy_logits, dim=1), num_samples=1)
+        else:
+            # Don't sample when testing.
+            action = torch.argmax(policy_logits, dim=1)
+
+        policy_logits = policy_logits.view(T, B, self.num_actions)
+        baseline = baseline.view(T, B)
+        action = action.view(T, B)
+
+        return (
+            dict(policy_logits=policy_logits, baseline=baseline, action=action),
+            core_state,
+        )
+
+Net = SimpleNet
+# Net = ConvNet
+
+
+def make_env(flags):
+    env_name = flags.env
+    render = flags.mode == "test_render"
+    if "Bullet" in env_name:
+        import pybullet_envs
+        try:
+            env = gym.make(env_name, isDiscrete=True, renders=render)
+        except TypeError:
+            env = gym.make(env_name, renders=render)
+    else:
+        env = gym.make(env_name)
+
+    if env.action_space.__class__.__name__ != "Discrete":
+        raise NotImplementedError("Continuous environments not supported yet")
+
+    return env
 
 
 def main(flags):
