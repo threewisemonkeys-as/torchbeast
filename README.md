@@ -1,4 +1,9 @@
 
+# Torchbeast Fork
+
+This fork aims to generalise the pytorch version of IMPALA to multiple different environments.
+
+
 # TorchBeast
 A PyTorch implementation of [IMPALA: Scalable Distributed
 Deep-RL with Importance Weighted Actor-Learner Architectures
